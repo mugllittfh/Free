@@ -1,0 +1,405 @@
+name: Secure RDP with Ollama Server
+run-name: RDP Session - ${{ github.actor }} - ${{ github.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Ollama model to download'
+        required: false
+        default: 'hf.co/mradermacher/Qwen2.5-Coder-7B-Instruct-abliterated-GGUF:Q4_K_M'
+        type: string
+      session_timeout_minutes:
+        description: 'Session timeout in minutes (5-360)'
+        required: false
+        default: '360'
+        type: string
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 370
+    
+    env:
+      RDP_USERNAME: 'RDP'
+      RDP_FIREWALL_RULE_RDP: 'RDP-Tailscale'
+      RDP_FIREWALL_RULE_OLLAMA: 'Ollama-API'
+      TAILSCALE_SERVICE: 'Tailscale'
+      OLLAMA_SERVICE: 'ollama'
+      OLLAMA_HOST: '0.0.0.0:11434'
+      OLLAMA_PORT: '11434'
+      RDP_PORT: '3389'
+      REMOTE_DESKTOP_SERVICE: 'TermService'
+
+    steps:
+      - name: Validate Input Parameters
+        shell: pwsh
+        run: |
+          $timeout = [int]"${{ github.event.inputs.session_timeout_minutes }}"
+          if ($timeout -lt 5 -or $timeout -gt 360) {
+              Write-Error "Session timeout must be between 5-360 minutes. Got: $timeout"
+              exit 1
+          }
+          Write-Host "✓ Parameters validated successfully"
+          Write-Host "  Model: ${{ github.event.inputs.model }}"
+          Write-Host "  Timeout: $timeout minutes"
+
+      - name: Configure RDP Settings
+        shell: pwsh
+        run: |
+          try {
+              # Enable RDP
+              Set-ItemProperty `
+                -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                -Name 'fDenyTSConnections' `
+                -Value 0 `
+                -Force `
+                -ErrorAction Stop
+              Write-Host "✓ RDP enabled"
+
+              # Disable Network Level Authentication
+              Set-ItemProperty `
+                -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                -Name 'UserAuthentication' `
+                -Value 0 `
+                -Force `
+                -ErrorAction Stop
+              Write-Host "✓ Network Level Authentication disabled"
+
+              # Set security layer to RDP
+              Set-ItemProperty `
+                -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                -Name 'SecurityLayer' `
+                -Value 0 `
+                -Force `
+                -ErrorAction Stop
+              Write-Host "✓ Security layer configured"
+
+              # Restart Remote Desktop service
+              Restart-Service -Name $env:REMOTE_DESKTOP_SERVICE -Force -ErrorAction Stop
+              Start-Sleep -Seconds 3
+              Write-Host "✓ Remote Desktop service restarted"
+          } catch {
+              Write-Error "Failed to configure RDP: $_"
+              exit 1
+          }
+
+      - name: Configure Firewall Rules
+        shell: pwsh
+        run: |
+          try {
+              # Remove existing rules
+              netsh advfirewall firewall delete rule name="$env:RDP_FIREWALL_RULE_RDP" 2>$null
+              netsh advfirewall firewall delete rule name="$env:RDP_FIREWALL_RULE_OLLAMA" 2>$null
+              Write-Host "✓ Old firewall rules cleaned up"
+
+              # Add RDP rule
+              netsh advfirewall firewall add rule `
+                name="$env:RDP_FIREWALL_RULE_RDP" `
+                dir=in `
+                action=allow `
+                protocol=TCP `
+                localport=$env:RDP_PORT `
+                2>&1 | Out-Null
+              Write-Host "✓ RDP firewall rule added (port $env:RDP_PORT)"
+
+              # Add Ollama rule
+              netsh advfirewall firewall add rule `
+                name="$env:RDP_FIREWALL_RULE_OLLAMA" `
+                dir=in `
+                action=allow `
+                protocol=TCP `
+                localport=$env:OLLAMA_PORT `
+                2>&1 | Out-Null
+              Write-Host "✓ Ollama firewall rule added (port $env:OLLAMA_PORT)"
+          } catch {
+              Write-Error "Failed to configure firewall: $_"
+              exit 1
+          }
+
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          try {
+              # Generate secure password
+              $charSets = @{
+                  Upper = ([char[]](65..90))
+                  Lower = ([char[]](97..122))
+                  Number = ([char[]](48..57))
+                  Special = (([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) | Get-Random -Count 4)
+              }
+
+              $password = @(
+                  ($charSets.Upper | Get-Random -Count 4)
+                  ($charSets.Lower | Get-Random -Count 4)
+                  ($charSets.Number | Get-Random -Count 4)
+                  $charSets.Special
+              ) | Get-Random -Count 16 | -join ''
+              
+              $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+              # Check if user exists
+              if (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue) {
+                  Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass -ErrorAction Stop
+                  Write-Host "✓ RDP user password reset"
+              } else {
+                  New-LocalUser `
+                    -Name $env:RDP_USERNAME `
+                    -Password $securePass `
+                    -AccountNeverExpires `
+                    -ErrorAction Stop | Out-Null
+                  
+                  Add-LocalGroupMember `
+                    -Group 'Administrators' `
+                    -Member $env:RDP_USERNAME `
+                    -ErrorAction Stop
+                  
+                  Add-LocalGroupMember `
+                    -Group 'Remote Desktop Users' `
+                    -Member $env:RDP_USERNAME `
+                    -ErrorAction Stop
+                  
+                  Write-Host "✓ RDP user created and configured"
+              }
+
+              # Verify user exists
+              if (-not (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue)) {
+                  throw "User creation verification failed"
+              }
+
+              # Store credentials in environment
+              Write-Output "RDP_USER=$env:RDP_USERNAME" | Out-File -FilePath $env:GITHUB_ENV -Encoding UTF8 -Append
+              Write-Output "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding UTF8 -Append
+          } catch {
+              Write-Error "Failed to create RDP user: $_"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          try {
+              $installerUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+              $installerPath = "$env:TEMP\tailscale-latest.msi"
+
+              Write-Host "Downloading Tailscale..."
+              $ProgressPreference = 'SilentlyContinue'
+              Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -ErrorAction Stop
+              Write-Host "✓ Tailscale downloaded"
+
+              Write-Host "Installing Tailscale..."
+              $result = Start-Process msiexec.exe `
+                -ArgumentList "/i `"$installerPath`" /quiet /norestart" `
+                -Wait `
+                -PassThru `
+                -ErrorAction Stop
+              
+              if ($result.ExitCode -ne 0) {
+                  throw "Installer exit code: $($result.ExitCode)"
+              }
+
+              Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 5
+              Write-Host "✓ Tailscale installed successfully"
+          } catch {
+              Write-Error "Failed to install Tailscale: $_"
+              exit 1
+          }
+
+      - name: Install Ollama
+        shell: pwsh
+        run: |
+          try {
+              Write-Host "Installing Ollama..."
+              $ProgressPreference = 'SilentlyContinue'
+              irm https://ollama.com/install.ps1 | iex
+              
+              Start-Sleep -Seconds 20
+              Write-Host "✓ Ollama installation script completed"
+
+              # Find Ollama executable
+              $possiblePaths = @(
+                  "$env:ProgramFiles\Ollama\ollama.exe"
+                  "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
+                  "$env:USERPROFILE\AppData\Local\Programs\Ollama\ollama.exe"
+              )
+
+              $ollamaPath = $null
+              foreach ($path in $possiblePaths) {
+                  if (Test-Path -Path $path -ErrorAction SilentlyContinue) {
+                      $ollamaPath = $path
+                      break
+                  }
+              }
+
+              if (-not $ollamaPath) {
+                  throw "Ollama executable not found in standard locations"
+              }
+
+              Write-Output "OLLAMA_EXE=$ollamaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding UTF8 -Append
+              Write-Host "✓ Ollama found at: $ollamaPath"
+          } catch {
+              Write-Error "Failed to install Ollama: $_"
+              exit 1
+          }
+
+      - name: Connect Tailscale
+        shell: pwsh
+        run: |
+          try {
+              if (-not (Test-Path -Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+                  throw "Tailscale executable not found"
+              }
+
+              Write-Host "Connecting Tailscale..."
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+                --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+                --hostname="gh-runner-${{ github.run_id }}" `
+                --accept-dns=false `
+                2>&1 | Out-Null
+
+              # Wait for IP assignment
+              $tailscaleIp = $null
+              $maxRetries = 12
+              $retryCount = 0
+
+              while (-not $tailscaleIp -and $retryCount -lt $maxRetries) {
+                  Start-Sleep -Seconds 5
+                  $tailscaleIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  if ($tailscaleIp) { $tailscaleIp = $tailscaleIp.Trim() }
+                  $retryCount++
+              }
+
+              if (-not $tailscaleIp) {
+                  throw "Failed to obtain Tailscale IP after $($maxRetries * 5) seconds"
+              }
+
+              Write-Output "TAILSCALE_IP=$tailscaleIp" | Out-File -FilePath $env:GITHUB_ENV -Encoding UTF8 -Append
+              Write-Host "✓ Tailscale connected: $tailscaleIp"
+          } catch {
+              Write-Error "Failed to connect Tailscale: $_"
+              exit 1
+          }
+
+      - name: Start Ollama Server
+        shell: pwsh
+        run: |
+          try {
+              if (-not (Test-Path -Path $env:OLLAMA_EXE)) {
+                  throw "Ollama executable not found at: $env:OLLAMA_EXE"
+              }
+
+              Write-Host "Starting Ollama server..."
+              $env:OLLAMA_HOST = $env:OLLAMA_HOST
+              
+              Start-Process -FilePath $env:OLLAMA_EXE `
+                -ArgumentList 'serve' `
+                -WindowStyle Hidden `
+                -ErrorAction Stop | Out-Null
+
+              # Wait for service startup
+              Start-Sleep -Seconds 15
+
+              # Verify process
+              $ollamaProcess = Get-Process -Name 'ollama' -ErrorAction SilentlyContinue
+              if ($ollamaProcess) {
+                  Write-Host "✓ Ollama server started (PID: $($ollamaProcess.Id))"
+              } else {
+                  throw "Ollama process not found after startup"
+              }
+
+              Write-Output "OLLAMA_URL=http://$env:TAILSCALE_IP`:11434" | Out-File -FilePath $env:GITHUB_ENV -Encoding UTF8 -Append
+          } catch {
+              Write-Error "Failed to start Ollama: $_"
+              exit 1
+          }
+
+      - name: Download Ollama Model
+        shell: pwsh
+        run: |
+          try {
+              if (-not (Test-Path -Path $env:OLLAMA_EXE)) {
+                  throw "Ollama executable path not set"
+              }
+
+              $model = '${{ github.event.inputs.model }}'
+              if ([string]::IsNullOrWhiteSpace($model)) {
+                  $model = 'hf.co/mradermacher/Qwen2.5-Coder-7B-Instruct-abliterated-GGUF:Q4_K_M'
+              }
+
+              Write-Host "Downloading model: $model (this may take several minutes)..."
+              
+              # Wait for Ollama to stabilize
+              Start-Sleep -Seconds 5
+              
+              & $env:OLLAMA_EXE pull $model
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Model pull failed with exit code: $LASTEXITCODE"
+              }
+
+              Write-Host "✓ Model downloaded successfully"
+              Write-Host "Available models:"
+              & $env:OLLAMA_EXE list
+          } catch {
+              Write-Error "Failed to download model: $_"
+              exit 1
+          }
+
+      - name: Verify RDP Port
+        shell: pwsh
+        run: |
+          try {
+              Write-Host "Verifying RDP port $env:RDP_PORT on $env:TAILSCALE_IP..."
+              $connection = Test-NetConnection `
+                -ComputerName $env:TAILSCALE_IP `
+                -Port $env:RDP_PORT `
+                -WarningAction SilentlyContinue `
+                -ErrorAction Stop
+
+              if ($connection.TcpTestSucceeded) {
+                  Write-Host "✓ RDP port is accessible"
+              } else {
+                  throw "RDP port connection failed"
+              }
+          } catch {
+              Write-Error "RDP port verification failed: $_"
+              exit 1
+          }
+
+      - name: Verify Ollama Port
+        shell: pwsh
+        run: |
+          try {
+              Write-Host "Verifying Ollama port $env:OLLAMA_PORT on $env:TAILSCALE_IP..."
+              $connection = Test-NetConnection `
+                -ComputerName $env:TAILSCALE_IP `
+                -Port $env:OLLAMA_PORT `
+                -WarningAction SilentlyContinue `
+                -ErrorAction Stop
+
+              if ($connection.TcpTestSucceeded) {
+                  Write-Host "✓ Ollama port is accessible"
+              } else {
+                  throw "Ollama port connection failed"
+              }
+          } catch {
+              Write-Error "Ollama port verification failed: $_"
+              exit 1
+          }
+
+      - name: Display Session Information
+        shell: pwsh
+        run: |
+          $timeout = [int]"${{ github.event.inputs.session_timeout_minutes }}"
+          $endTime = (Get-Date).AddMinutes($timeout)
+
+          Write-Host "`n╔═════════════════════════════════════════════╗"
+          Write-Host "║       RDP & OLLAMA ACCESS INFORMATION       ║"
+          Write-Host "╠═════════════════════════════════════════════╣"
+          Write-Host "║ RDP Host:           $env:TAILSCALE_IP"
+          Write-Host "║ RDP Username:       $env:RDP_USER"
+          Write-Host "║ RDP Password:       $env:RDP_PASS"
+          Write-Host "║ RDP Port:           $env:RDP_PORT"
+          Write-Host "║                                             ║"
+          Write-Host "║ Ollama API:         $env:OLLAMA_URL"
+          Write-Host "║ Ollama Port:        $env:
